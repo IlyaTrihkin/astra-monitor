@@ -15,17 +15,44 @@ else
     exit 1
 fi
 
+# --- Значения по умолчанию (если не заданы в конфиге) ---
+TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-no}
+TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-""}
+TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-""}
+ZABBIX_ENABLED=${ZABBIX_ENABLED:-no}
+ZABBIX_SERVER=${ZABBIX_SERVER:-127.0.0.1}
+ZABBIX_HOST=${ZABBIX_HOST:-astra-server}
+ZABBIX_SENDER=${ZABBIX_SENDER:-/usr/bin/zabbix_sender}
+CPU_THRESHOLD=${CPU_THRESHOLD:-80}
+RAM_THRESHOLD=${RAM_THRESHOLD:-85}
+DISK_THRESHOLD=${DISK_THRESHOLD:-90}
+LOG_FILE=${LOG_FILE:-/var/log/astra-monitor.log}
+
 # --- Функция логирования ---
 log() {
     echo "[$(date "+%Y-%m-%d %H:%M:%S")] $1" | tee -a "$LOG_FILE"
 }
 
 # --- Сбор метрик ---
-CPU=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
+CPU_RAW=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | sed 's/,/./')
+if [ -z "$CPU_RAW" ]; then
+    CPU=0
+else
+    CPU=$(echo "$CPU_RAW" | awk '{printf "%.0f", $1}')
+fi
+
 RAM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
 RAM_USED=$(free -m | awk '/Mem:/ {print $3}')
-RAM_PERCENT=$((RAM_USED * 100 / RAM_TOTAL))
+if [ -z "$RAM_TOTAL" ] || [ -z "$RAM_USED" ]; then
+    RAM_PERCENT=0
+else
+    RAM_PERCENT=$((RAM_USED * 100 / RAM_TOTAL))
+fi
+
 DISK_USAGE=$(df -h / | awk 'NR==2 {print $5}' | sed 's/%//')
+if [ -z "$DISK_USAGE" ]; then
+    DISK_USAGE=0
+fi
 
 # --- Проверка порогов ---
 MESSAGES=""
@@ -39,26 +66,7 @@ if [ "$DISK_USAGE" -gt "$DISK_THRESHOLD" ]; then
     MESSAGES="$MESSAGES\n🔴 Мало свободного места на диске: $DISK_USAGE% (порог $DISK_THRESHOLD%)"
 fi
 
-# --- Отправка в Telegram ---
-send_telegram() {
-    local text="$1"
-    curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
-        -d chat_id="$TELEGRAM_CHAT_ID" \
-        -d text="$text" \
-        -d parse_mode="HTML" > /dev/null 2>&1
-}
-
-# --- Отправка в Zabbix ---
-send_zabbix() {
-    if [ "$ZABBIX_ENABLED" = "yes" ]; then
-        $ZABBIX_SENDER -z "$ZABBIX_SERVER" -s "$ZABBIX_HOST" -k "system.cpu.load" -o "$CPU" > /dev/null 2>&1
-        $ZABBIX_SENDER -z "$ZABBIX_SERVER" -s "$ZABBIX_HOST" -k "system.ram.percent" -o "$RAM_PERCENT" > /dev/null 2>&1
-        $ZABBIX_SENDER -z "$ZABBIX_SERVER" -s "$ZABBIX_HOST" -k "system.disk.percent" -o "$DISK_USAGE" > /dev/null 2>&1
-        log "Метрики отправлены в Zabbix."
-    fi
-}
-
-# --- Формирование сообщения ---
+# --- Формирование отчёта ---
 CURRENT_TIME=$(date "+%Y-%m-%d %H:%M:%S")
 REPORT="📊 <b>Отчёт по ресурсам Astra Linux</b>\n"
 REPORT="$REPORT\n🕐 Время: $CURRENT_TIME"
@@ -73,12 +81,27 @@ else
     REPORT="$REPORT\n\n✅ Все показатели в норме."
 fi
 
-# --- Отправка ---
-if [ "$TELEGRAM_ENABLED" = "yes" ]; then
-    send_telegram "$REPORT"
+# --- ВСЕГДА ВЫВОДИМ В КОНСОЛЬ ---
+echo -e "$REPORT"
+
+# --- Логирование ---
+log "Отчёт сгенерирован"
+
+# --- Отправка в Telegram ---
+if [ "$TELEGRAM_ENABLED" = "yes" ] && [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+    curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
+        -d chat_id="$TELEGRAM_CHAT_ID" \
+        -d text="$REPORT" \
+        -d parse_mode="HTML" > /dev/null 2>&1
     log "Отчёт отправлен в Telegram."
 fi
 
-send_zabbix
+# --- Отправка в Zabbix ---
+if [ "$ZABBIX_ENABLED" = "yes" ] && [ -x "$ZABBIX_SENDER" ]; then
+    $ZABBIX_SENDER -z "$ZABBIX_SERVER" -s "$ZABBIX_HOST" -k "system.cpu.load" -o "$CPU" > /dev/null 2>&1
+    $ZABBIX_SENDER -z "$ZABBIX_SERVER" -s "$ZABBIX_HOST" -k "system.ram.percent" -o "$RAM_PERCENT" > /dev/null 2>&1
+    $ZABBIX_SENDER -z "$ZABBIX_SERVER" -s "$ZABBIX_HOST" -k "system.disk.percent" -o "$DISK_USAGE" > /dev/null 2>&1
+    log "Метрики отправлены в Zabbix."
+fi
 
 log "Мониторинг завершён."
